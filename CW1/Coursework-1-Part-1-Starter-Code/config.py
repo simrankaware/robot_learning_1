@@ -16,3 +16,8 @@ WINDOW_SIZE = 800
 FRAME_RATE = 10
 
 # You may want to add your own configuration variables here, depending on the algorithm you implement.
+# Part 1: Cross-Entropy Method (CEM) parameters
+CEM_NUM_ITER = 5
+CEM_NUM_PATHS = 300
+CEM_EPISODE_LENGTH = 100
+CEM_NUM_ELITES = 20

@@ -13,3 +13,9 @@ FRAME_RATE = 20
 
 # You may want to add your own configuration variables here, depending on the algorithm you implement.
 EPISODE_LENGTH = 20
+CEM_NUM_ITER = 7
+CEM_NUM_PATHS = 150
+CEM_EPISODE_LENGTH = 30
+CEM_NUM_ELITES = 5
+TRAIN_NUM_MINIBATCH = 30
+TRAIN_MINIBATCH_SIZE = 30

@@ -58,26 +58,30 @@ class Robot:
     # Function to get the next action in the plan
     def select_action(self, state):
         # For now, a random action, biased towards 'moving right'
-        action = np.random.uniform(low=-constants.MAX_ACTION_MAGNITUDE, high=0.5*constants.MAX_ACTION_MAGNITUDE, size=2)
-        self.num_steps += 1
 
         if self.num_steps == 0:
             # Reset visualisation 
             self.model_visualisation_lines = []
             self.planning_visualisation_lines = []
+            # Plan a sequence of actions using CEM Planning
             self.cem_planning(state)
+        
+        action = self.planned_actions[self.num_steps]
+        self.num_steps += 1
 
         if self.num_steps == config.EPISODE_LENGTH:
             self.reset()
             self.num_episodes += 1 
+            self.dynamics_model.train(self.replay_buffer, config.TRAIN_NUM_MINIBATCH)
+            self.create_model_visualisations()
             episode_done = True
         else:
             episode_done = False
-        # Train the model on all data collected every 20 peisodes
-        if self.num_episodes == 20 and not self.model_trained:
-            self.dynamics_model.train(self.replay_buffer)
-            self.create_model_visualisations()
-            self.model_trained = True
+        # # Train the model on all data collected every 20 peisodes
+        # if self.num_episodes == 20 and not self.model_trained:
+        #     self.dynamics_model.train(self.replay_buffer)
+        #     self.create_model_visualisations()
+        #     self.model_trained = True
         return action, episode_done
 
     # Function to add a transition to the buffer
@@ -85,8 +89,135 @@ class Robot:
         self.replay_buffer.add_transition(state, action, next_state)
 
     def create_model_visualisations(self):
-        # TO FILL IN
-        pass
+        self.model_visualisation_lines = []
+        
+        # --- PARAMETERS ----
+        grid_size = 10
+        delta = 0.05 
+        width = 0.005 
+
+        actions = [
+            (np.array([0.0, +delta]), (255, 0, 0)),   # red
+            (np.array([+delta, 0.0]), (0, 200, 0)),   # green
+            (np.array([0.0, -delta]), (0, 0, 255)),   # blue
+            (np.array([-delta, 0.0]), (200, 200, 0)), # yellow
+        ]
+
+        # Joint space grid 
+        theta1_vals = np.linspace(-1.5, 1.5, grid_size)
+        theta2_vals = np.linspace(-1.5, 1.5, grid_size)
+
+        for theta1 in theta1_vals:
+            for theta2 in theta2_vals:
+
+                # "State" is now joint angles
+                state = np.array([theta1, theta2], dtype=np.float32)
+
+                # Project state to workspace (cell centre)
+                hand_pos = self.forward_kinematics(state)[-1]
+                x1, y1 = hand_pos
+
+                # Apply the 4 canonical actions
+                for action, colour in actions:
+                    next_state = self.dynamics_model.predict_next_state(state, action)
+
+                    # Project predicted next state to workspace
+                    next_hand_pos = self.forward_kinematics(next_state)[-1]
+                    x2, y2 = next_hand_pos
+
+                    # Draw short arrow
+                    line = VisualisationLine(x1, y1, x2, y2, colour, width)
+                    self.model_visualisation_lines.append(line)
+
+ 
+   
+
+
+    def cem_planning(self, state):
+        sampled_actions = np.zeros([config.CEM_NUM_ITER, config.CEM_NUM_PATHS, config.CEM_EPISODE_LENGTH, 2], dtype=np.float32)
+        sampled_paths = np.zeros([config.CEM_NUM_ITER, config.CEM_NUM_PATHS, config.CEM_EPISODE_LENGTH+1, 2], dtype=np.float32)
+        path_distances = np.zeros([config.CEM_NUM_ITER, config.CEM_NUM_PATHS], dtype=np.float32) # algo developed such that the robot regularly reaches within a distance of 0.01 of goal state
+        action_mean = np.zeros([config.CEM_NUM_ITER, config.CEM_EPISODE_LENGTH, 2], dtype=np.float32)
+        action_std = np.zeros([config.CEM_NUM_ITER, config.CEM_EPISODE_LENGTH, 2], dtype=np.float32)
+
+        # Loop over the CEM iterations
+        for iter_num in range(config.CEM_NUM_ITER):
+            # Loop over the number of paths to sample
+            for path_num in range(config.CEM_NUM_PATHS):
+                # Assign initial state to sampled_paths and pointer
+                sampled_paths[iter_num, path_num, 0] = state
+                curr_state = state
+                # Sample actions for each step of the episode
+                for step in range(config.CEM_EPISODE_LENGTH):
+                    # If first iteration, sample from uniform distribution
+                    if iter_num == 0:
+                        action = np.random.uniform(-constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE, 2)
+                    # If not, sample an action from the distribution cxaleculated from previous iteration
+                    else:
+                        action = np.random.normal(action_mean[iter_num-1, step], action_std[iter_num-1, step], 2)
+                        action = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
+                    # Calculate the next state using the environment dynamics
+                    next_state = self.dynamics_model.predict_next_state(curr_state, action) 
+                    sampled_actions[iter_num, path_num, step] = action
+                    sampled_paths[iter_num, path_num, step+1] = next_state
+                    curr_state = next_state
+                
+                # Calculate the distance between the final state and the goal state for this path
+                final_state = sampled_paths[iter_num, path_num, -1]
+                hand_pos = self.forward_kinematics(final_state)[-1]
+                goal_dist = np.linalg.norm(hand_pos - self.goal_state)
+                motion_penalty = np.linalg.norm(final_state - state) 
+                distance = goal_dist - 0.1 * motion_penalty
+                
+                path_distances[iter_num, path_num] = distance
+
+            # Select the elite paths based on the distances
+            elites = np.argsort(path_distances[iter_num])[:config.CEM_NUM_ELITES]
+            elite_actions = sampled_actions[iter_num, elites]
+            action_mean[iter_num] = np.mean(elite_actions, axis=0)
+            action_std[iter_num] = np.std(elite_actions, axis=0)
+            
+
+        # Open Planning: Planned action is the optimal action sequence from the final iteration
+        best_path_index = np.argmin(path_distances[-1])
+        self.planned_actions = sampled_actions[-1, best_path_index]
+
+
+        # Compute paths for mean action sequence for visualisation
+        mean_paths = np.zeros([config.CEM_NUM_ITER, config.CEM_EPISODE_LENGTH+1, 2], dtype=np.float32)
+        for iter_num in range(config.CEM_NUM_ITER):
+            curr_state = state
+            mean_paths[iter_num, 0] = state
+            for step in range(config.CEM_EPISODE_LENGTH):
+                next_state = self.dynamics_model.predict_next_state(curr_state, action_mean[iter_num, step])
+                mean_paths[iter_num, step+1] = next_state
+                curr_state = next_state
+        
+        # Create visualisation for the mean path in each iteration
+        self.planning_visualisation_lines = []
+        for iter_num in range(config.CEM_NUM_ITER):
+            intensity = (iter_num + 1) / config.CEM_NUM_ITER
+            brightness = 50 + 205 * intensity
+            colour = (brightness, brightness, brightness)
+            width = 0.002 + 0.003 * intensity
+            for step in range(config.CEM_EPISODE_LENGTH):
+                a1_1, a2_1 = mean_paths[iter_num, step]
+                a1_2, a2_2 = mean_paths[iter_num, step + 1]
+                x1, y1 = self.forward_kinematics([a1_1, a2_1])[-1]
+                x2, y2 = self.forward_kinematics([a1_2, a2_2])[-1]
+                line = VisualisationLine(x1, y1, x2, y2, colour, width)
+                self.planning_visualisation_lines.append(line)
+        
+        # final_states = sampled_paths[-1, :, -1]
+        # hand_positions = np.array([self.forward_kinematics(s)[-1] for s in final_states])
+        # final_distances = np.linalg.norm(hand_positions - self.goal_state, axis=1)
+        
+        # print("Best/ Mean/ Worst final distances to goal in last iteration: ",
+        #       np.min(final_distances),
+        #       np.mean(final_distances),
+        #       np.max(final_distances))
+    
+        
 
 
 # The VisualisationLine class enables us to store a line segment which will be drawn to the screen
@@ -152,12 +283,13 @@ class DynamicsModel:
         plt.show()
     
     # Start training the dynamics model on the data in the buffer
-    def train(self, buffer, num_minibatches=1000, minibatch_size=64):
-        if buffer.size < minibatch_size:
+    def train(self, buffer, num_minibatches):
+        if buffer.size < config.TRAIN_MINIBATCH_SIZE:
             return
         loss_sum = 0
         for _ in range(num_minibatches):
-            inputs, targets = buffer.sample_minibatch(minibatch_size)
+            inputs, targets = buffer.sample_minibatch(config.TRAIN_MINIBATCH_SIZE)
+            self.network.train()
 
             predictions = self.network(inputs)
             loss = self.loss_function(predictions, targets)
@@ -166,7 +298,10 @@ class DynamicsModel:
             self.optimizer.step()
 
             # Log loss per minibatch
-            self.losses.append(loss.item())
+            loss_value = loss.item()
+            loss_sum += loss_value
+        ave_loss = loss_sum / num_minibatches
+        self.losses.append(ave_loss)
         self.line.set_xdata(range(1, len(self.losses)+1))
         self.line.set_ydata(self.losses)
         self.ax.relim()
@@ -198,17 +333,6 @@ class ReplayBuffer:
     def add_transition(self, state, action, next_state):
         self.data.append((state, action, next_state))
         self.size += 1
-    
-    # Retrieve data collected
-    def retrieve_data(self):
-        states, actions, next_states = zip(*self.data)
-        inputs = np.concatenate([states, actions], axis=1)
-        targets = np.array(next_states)
-
-        inputs = torch.from_numpy(inputs).float()
-        targets = torch.from_numpy(targets).float()
-
-        return inputs, targets
 
     def sample_minibatch(self, minibatch_size):
         if minibatch_size > self.size:

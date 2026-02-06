@@ -60,7 +60,7 @@ class Robot:
                 # Assign initial state to sampled_paths and pointer
                 sampled_paths[iter_num, path_num, 0] = state
                 curr_state = state
-
+                collision = False
                 # Sample actions for each step of the episode
                 for step in range(config.CEM_EPISODE_LENGTH):
                     # If first iteration, sample from uniform distribution
@@ -72,6 +72,9 @@ class Robot:
                         action = np.clip(action, -constants.MAX_ACTION_MAGNITUDE, constants.MAX_ACTION_MAGNITUDE)
                     # Calculate the next state using the environment dynamics
                     next_state = self.environment.dynamics(curr_state, action)
+                    joints = self.environment.get_joint_pos_from_state(next_state)
+                    if self.collides(joints):
+                        collision = True
                     sampled_actions[iter_num, path_num, step] = action
                     sampled_paths[iter_num, path_num, step+1] = next_state
                     curr_state = next_state
@@ -80,6 +83,8 @@ class Robot:
                 final_state = sampled_paths[iter_num, path_num, -1]
                 hand_pos = self.environment.get_joint_pos_from_state(final_state)[-1]
                 distance = np.linalg.norm(hand_pos - self.environment.goal_state)
+                if collision:
+                    distance += 10.0
                 path_distances[iter_num, path_num] = distance
 
             # Select the elite paths based on the distances
@@ -129,6 +134,22 @@ class Robot:
               np.min(final_distances),
               np.mean(final_distances),
               np.max(final_distances))
+        
+    
+    def collides(self, joint_positions):
+        obs_pos = self.environment.obstacle_pos
+        obs_rad = self.environment.obstacle_radius
+
+        for i in range(len(joint_positions) - 1):
+            if self.environment.line_circle_intersection(
+                joint_positions[i],
+                joint_positions[i-1],
+                obs_pos,
+                obs_rad
+            ):
+                return True
+        return False
+
 
              
 
